@@ -11,6 +11,7 @@ const Coupon = require("../models/Coupon");
 const Report = require("../models/Report");
 const Booking = require("../models/Booking");
 const Subscription = require("../models/Subscription");
+const Setting = require("../models/Setting");
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "travelmate@admin";
@@ -293,6 +294,75 @@ router.post("/reports/:id/block", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error("admin/reports block error:", err);
     res.status(500).json({ success: false, message: "Failed to block user" });
+  }
+});
+
+// ---------- PRICING / PLANS ----------
+const PRICING_DEFAULTS = {
+  plans: {
+    daily:   { price: 30,   durationDays: 1 },
+    monthly: { price: 650,  durationDays: 30 },
+    yearly:  { price: 1200, durationDays: 365 },
+  },
+  findRide: { unlockFee: 49, processingFee: 1 },
+};
+
+const posNum = (v, fallback) =>
+  Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : fallback;
+
+// Get-or-create the single pricing document.
+async function getPricingDoc() {
+  let doc = await Setting.findOne({ key: "pricing" });
+  if (!doc) doc = await Setting.create({ key: "pricing", ...PRICING_DEFAULTS });
+  return doc;
+}
+
+router.get("/pricing", requireAdmin, async (req, res) => {
+  try {
+    const doc = await getPricingDoc();
+    res.json({
+      success: true,
+      data: {
+        plans: {
+          daily:   { price: posNum(doc.plans?.daily?.price, 30),    durationDays: posNum(doc.plans?.daily?.durationDays, 1) },
+          monthly: { price: posNum(doc.plans?.monthly?.price, 650),  durationDays: posNum(doc.plans?.monthly?.durationDays, 30) },
+          yearly:  { price: posNum(doc.plans?.yearly?.price, 1200),  durationDays: posNum(doc.plans?.yearly?.durationDays, 365) },
+        },
+        findRide: {
+          unlockFee:     posNum(doc.findRide?.unlockFee, 49),
+          processingFee: posNum(doc.findRide?.processingFee, 1),
+        },
+        updatedAt: doc.updatedAt,
+      },
+    });
+  } catch (err) {
+    console.error("admin/pricing GET error:", err);
+    res.status(500).json({ success: false, message: "Failed to load pricing" });
+  }
+});
+
+router.put("/pricing", requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const doc = await getPricingDoc();
+
+    const p = body.plans || {};
+    ["daily", "monthly", "yearly"].forEach((k) => {
+      if (p[k]) {
+        if (p[k].price !== undefined) doc.plans[k].price = posNum(p[k].price, doc.plans[k].price);
+        if (p[k].durationDays !== undefined) doc.plans[k].durationDays = posNum(p[k].durationDays, doc.plans[k].durationDays);
+      }
+    });
+
+    const f = body.findRide || {};
+    if (f.unlockFee !== undefined) doc.findRide.unlockFee = posNum(f.unlockFee, doc.findRide.unlockFee);
+    if (f.processingFee !== undefined) doc.findRide.processingFee = posNum(f.processingFee, doc.findRide.processingFee);
+
+    await doc.save();
+    res.json({ success: true, message: "Pricing updated", data: doc });
+  } catch (err) {
+    console.error("admin/pricing PUT error:", err);
+    res.status(500).json({ success: false, message: "Failed to update pricing" });
   }
 });
 
