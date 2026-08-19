@@ -10,6 +10,7 @@ const Ride = require("../models/Ride");
 const Coupon = require("../models/Coupon");
 const Report = require("../models/Report");
 const Booking = require("../models/Booking");
+const RideRequest = require("../models/RideRequest");
 const Subscription = require("../models/Subscription");
 const Setting = require("../models/Setting");
 
@@ -64,18 +65,23 @@ router.get("/me", requireAdmin, (req, res) => res.json({ success: true, admin: {
 router.get("/stats", requireAdmin, async (req, res) => {
   try {
     const todayStr = new Date().toISOString().slice(0, 10);
-    const [totalUsers, blockedUsers, totalRides, upcomingRides, totalBookings, completedBookings, coupons, totalReports, pendingReports, subscriptions] = await Promise.all([
+    const [totalUsers, blockedUsers, totalRides, upcomingRides, legacyBookings, legacyCompleted, confirmedReqs, paidReqs, coupons, totalReports, pendingReports, subscriptions] = await Promise.all([
       User.countDocuments({}),
       User.countDocuments({ isBlocked: true }),
       Ride.countDocuments({}),
       Ride.countDocuments({ date: { $gte: todayStr } }),
       Booking.countDocuments({}),
       Booking.countDocuments({ status: "completed" }),
+      // NEW flow: confirmed = accepted requests; "rode/completed" = paid.
+      RideRequest.countDocuments({ status: "accepted" }),
+      RideRequest.countDocuments({ status: "accepted", paymentStatus: "paid" }),
       Coupon.find({}),
       Report.countDocuments({}),
       Report.countDocuments({ status: "pending" }),
       Subscription.find({}),
     ]);
+    const totalBookings = legacyBookings + confirmedReqs;
+    const completedBookings = legacyCompleted + paidReqs;
 
     const totalRedemptions = coupons.reduce((s, c) => s + (c.usedCount || 0), 0);
     const uniqueRedeemers = new Set();
@@ -212,19 +218,52 @@ router.delete("/coupons/:id", requireAdmin, async (req, res) => {
 router.get("/rides", requireAdmin, async (req, res) => {
   try {
     const rides = await Ride.find({}).sort({ createdAt: -1 });
+
+    // Legacy bookings (old "Booking" collection).
     const bookings = await Booking.find({}).sort({ createdAt: -1 });
-    const byRide = {};
-    bookings.forEach((b) => { (byRide[String(b.rideId)] = byRide[String(b.rideId)] || []).push(b); });
+    const bookingByRide = {};
+    bookings.forEach((b) => { (bookingByRide[String(b.rideId)] = bookingByRide[String(b.rideId)] || []).push(b); });
+
+    // NEW booking flow: a rider is "booked" once the driver CONFIRMS the
+    // request (status accepted). "rode" == they also completed payment (paid).
+    // pending / rejected / cancelled / expired don't count as booked.
+    const reqs = await RideRequest.find({ status: "accepted" }).sort({ createdAt: -1 });
+    const reqByRide = {};
+    reqs.forEach((r) => { (reqByRide[String(r.rideId)] = reqByRide[String(r.rideId)] || []).push(r); });
+
+    const last10 = (p) => String(p || "").replace(/\D/g, "").slice(-10);
+
     const data = [];
     for (const r of rides) {
       const poster = await findUserByPhone(r.userPhone);
-      const rb = byRide[String(r._id)] || [];
+      const legacy = bookingByRide[String(r._id)] || [];
+      const confirmed = reqByRide[String(r._id)] || [];
+
+      // Merge both sources, de-duplicated by rider phone (last-10 digits).
+      const ridersMap = new Map();
+      legacy.forEach((b) => {
+        ridersMap.set(last10(b.riderPhone), {
+          phone: b.riderPhone, name: b.riderName || "Rider",
+          status: b.status, bookedAt: b.createdAt,
+        });
+      });
+      confirmed.forEach((rq) => {
+        ridersMap.set(last10(rq.riderPhone), {
+          phone: rq.riderPhone, name: rq.riderName || "Rider",
+          // "paid" when payment completed, else "booked" (confirmed).
+          status: rq.paymentStatus === "paid" ? "paid" : "booked",
+          bookedAt: rq.createdAt,
+        });
+      });
+      const riders = Array.from(ridersMap.values());
+      const rodeCount = riders.filter((x) => x.status === "completed" || x.status === "paid").length;
+
       data.push({
         _id: r._id, from: r.from, to: r.to, date: r.date, time: r.time, vehicle: r.vehicle,
         seatsAvailable: r.seatsAvailable, viewCount: r.viewCount || 0, createdAt: r.createdAt,
         poster: { phone: r.userPhone || "", name: poster?.fullName || "TravelMate Rider", photo: poster?.photo || "" },
-        bookedCount: rb.length, rodeCount: rb.filter((b) => b.status === "completed").length,
-        riders: rb.map((b) => ({ phone: b.riderPhone, name: b.riderName || "Rider", status: b.status, bookedAt: b.createdAt })),
+        bookedCount: riders.length, rodeCount,
+        riders,
       });
     }
     res.json({ success: true, count: data.length, data });
@@ -304,7 +343,8 @@ const PRICING_DEFAULTS = {
     monthly: { price: 650,  durationDays: 30 },
     yearly:  { price: 1200, durationDays: 365 },
   },
-  findRide: { unlockFee: 49, processingFee: 1 },
+  // dailyPrice = Find Ride Daily plan price (separate from Post Ride Daily).
+  findRide: { unlockFee: 49, processingFee: 1, dailyPrice: 1 },
 };
 
 const posNum = (v, fallback) =>
@@ -331,6 +371,7 @@ router.get("/pricing", requireAdmin, async (req, res) => {
         findRide: {
           unlockFee:     posNum(doc.findRide?.unlockFee, 49),
           processingFee: posNum(doc.findRide?.processingFee, 1),
+          dailyPrice:    posNum(doc.findRide?.dailyPrice, 1),
         },
         updatedAt: doc.updatedAt,
       },
@@ -355,8 +396,11 @@ router.put("/pricing", requireAdmin, async (req, res) => {
     });
 
     const f = body.findRide || {};
+    if (!doc.findRide) doc.findRide = {};
     if (f.unlockFee !== undefined) doc.findRide.unlockFee = posNum(f.unlockFee, doc.findRide.unlockFee);
     if (f.processingFee !== undefined) doc.findRide.processingFee = posNum(f.processingFee, doc.findRide.processingFee);
+    if (f.dailyPrice !== undefined) doc.findRide.dailyPrice = posNum(f.dailyPrice, doc.findRide.dailyPrice != null ? doc.findRide.dailyPrice : 1);
+    doc.markModified("findRide");
 
     await doc.save();
     res.json({ success: true, message: "Pricing updated", data: doc });
