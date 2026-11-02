@@ -13,6 +13,7 @@ const Booking = require("../models/Booking");
 const RideRequest = require("../models/RideRequest");
 const Subscription = require("../models/Subscription");
 const Setting = require("../models/Setting");
+const BusRoute = require("../models/BusRoute");
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "travelmate@admin";
@@ -261,7 +262,7 @@ router.get("/rides", requireAdmin, async (req, res) => {
       data.push({
         _id: r._id, from: r.from, to: r.to, date: r.date, time: r.time, vehicle: r.vehicle,
         seatsAvailable: r.seatsAvailable, viewCount: r.viewCount || 0, createdAt: r.createdAt,
-        poster: { phone: r.userPhone || "", name: poster?.fullName || "TravelMate Rider", photo: poster?.photo || "" },
+        poster: { phone: r.userPhone || "", name: poster?.fullName || "Vooggly Rider", photo: poster?.photo || "" },
         bookedCount: riders.length, rodeCount,
         riders,
       });
@@ -443,6 +444,104 @@ router.post("/users/unblock", requireAdmin, async (req, res) => {
     res.json({ success: true, message: "User unblocked", data: { phone: user.phone, isBlocked: false } });
   } catch {
     res.status(500).json({ success: false, message: "Failed to unblock user" });
+  }
+});
+
+// ---------- BUS ROUTES (admin-managed) ----------
+// Normalize + sanitize a bus-route payload from the admin form.
+function cleanBusRoutePayload(body) {
+  const b = body || {};
+  const stops = Array.isArray(b.stops)
+    ? b.stops
+        .map((s) => (typeof s === "string" ? { name: s } : s))
+        .map((s) => ({
+          name: String(s?.name || "").trim(),
+          lat: Number.isFinite(Number(s?.lat)) ? Number(s.lat) : null,
+          lon: Number.isFinite(Number(s?.lon)) ? Number(s.lon) : null,
+        }))
+        .filter((s) => s.name)
+    : [];
+  return {
+    busNumber: String(b.busNumber || "").trim(),
+    operator: String(b.operator || "").trim(),
+    state: String(b.state || "Tamil Nadu").trim() || "Tamil Nadu",
+    from: String(b.from || "").trim(),
+    to: String(b.to || "").trim(),
+    fromLat: Number.isFinite(Number(b.fromLat)) ? Number(b.fromLat) : null,
+    fromLon: Number.isFinite(Number(b.fromLon)) ? Number(b.fromLon) : null,
+    toLat: Number.isFinite(Number(b.toLat)) ? Number(b.toLat) : null,
+    toLon: Number.isFinite(Number(b.toLon)) ? Number(b.toLon) : null,
+    stops,
+    notes: String(b.notes || "").slice(0, 500),
+    active: b.active === undefined ? true : !!b.active,
+  };
+}
+function validateBusRoute(p) {
+  if (!p.busNumber) return "Bus number is required";
+  if (!p.from) return "Starting location is required";
+  if (!p.to) return "Destination is required";
+  return "";
+}
+
+// List (with optional search by number/from/to)
+router.get("/bus-routes", requireAdmin, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    let filter = {};
+    if (q) {
+      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter = { $or: [{ busNumber: rx }, { from: rx }, { to: rx }] };
+    }
+    const rows = await BusRoute.find(filter).sort({ updatedAt: -1 }).limit(500).lean();
+    res.json({ success: true, count: rows.length, data: rows });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to load bus routes" });
+  }
+});
+
+// Create
+router.post("/bus-routes", requireAdmin, async (req, res) => {
+  try {
+    const p = cleanBusRoutePayload(req.body);
+    const err = validateBusRoute(p);
+    if (err) return res.status(400).json({ success: false, message: err });
+    const route = await BusRoute.create(p);
+    res.status(201).json({ success: true, data: route });
+  } catch (e) {
+    if (e && e.code === 11000) {
+      return res.status(409).json({ success: false, message: "A route with this bus number already exists." });
+    }
+    res.status(500).json({ success: false, message: "Failed to create bus route" });
+  }
+});
+
+// Update
+router.put("/bus-routes/:id", requireAdmin, async (req, res) => {
+  try {
+    const p = cleanBusRoutePayload(req.body);
+    const err = validateBusRoute(p);
+    if (err) return res.status(400).json({ success: false, message: err });
+    const route = await BusRoute.findById(req.params.id);
+    if (!route) return res.status(404).json({ success: false, message: "Bus route not found" });
+    Object.assign(route, p);
+    await route.save(); // pre-validate recomputes searchKey
+    res.json({ success: true, data: route });
+  } catch (e) {
+    if (e && e.code === 11000) {
+      return res.status(409).json({ success: false, message: "A route with this bus number already exists." });
+    }
+    res.status(500).json({ success: false, message: "Failed to update bus route" });
+  }
+});
+
+// Delete
+router.delete("/bus-routes/:id", requireAdmin, async (req, res) => {
+  try {
+    const r = await BusRoute.findByIdAndDelete(req.params.id);
+    if (!r) return res.status(404).json({ success: false, message: "Bus route not found" });
+    res.json({ success: true, message: "Bus route deleted" });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to delete bus route" });
   }
 });
 
