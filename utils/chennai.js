@@ -60,13 +60,17 @@ function normalize(s) {
   return String(s || "").toLowerCase().replace(/[.\-_/]/g, " ").replace(/\s+/g, " ").trim();
 }
 
-// True if a single place is within Chennai.
+// True if a single place is within Chennai. We ACCEPT any place by default and
+// reject only names that clearly belong to another city / district / state.
+// (A strict allowlist wrongly rejected real Chennai localities like "Island
+// Ground" or "Ayanavaram", so we block the outsiders instead.) CHENNAI_AREAS is
+// kept only as documentation of known Chennai localities.
 function isChennaiPlace(name) {
   const s = normalize(name);
   if (!s) return false;
-  if (OUTSIDE.some((c) => s.includes(c))) return false;
-  return CHENNAI_AREAS.some((a) => s.includes(a));
+  return !OUTSIDE.some((c) => s.includes(c));
 }
+void CHENNAI_AREAS;
 
 // Returns "" if the whole route is Chennai-only, else a reason naming the first
 // place that is outside Chennai.
