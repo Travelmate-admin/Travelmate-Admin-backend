@@ -14,6 +14,7 @@ const RideRequest = require("../models/RideRequest");
 const Subscription = require("../models/Subscription");
 const Setting = require("../models/Setting");
 const BusRoute = require("../models/BusRoute");
+const BusRouteImport = require("../models/BusRouteImport");
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "travelmate@admin";
@@ -542,6 +543,124 @@ router.delete("/bus-routes/:id", requireAdmin, async (req, res) => {
     res.json({ success: true, message: "Bus route deleted" });
   } catch (e) {
     res.status(500).json({ success: false, message: "Failed to delete bus route" });
+  }
+});
+
+// ---------- BUS ROUTE BULK IMPORT (Excel / CSV) ----------
+// The admin uploads one Excel/CSV; the frontend parses it (SheetJS), groups
+// rows by bus number and validates, then POSTs the clean route objects here.
+// This endpoint only writes to the SAME busroutes collection used by the
+// manual form — imported and manually-added routes live together.
+
+// Normalize one grouped import route. Mirrors cleanBusRoutePayload but also
+// captures the extra optional columns (busName, busType, distance, via, and
+// per-stop order / arrival / departure times).
+function cleanBulkRoute(r) {
+  const b = r || {};
+  const stops = Array.isArray(b.stops)
+    ? b.stops
+        .map((s, i) => ({
+          name: String((s && s.name) || "").trim(),
+          order: Number.isFinite(Number(s?.order)) ? Number(s.order) : i + 1,
+          arrivalTime: String(s?.arrivalTime || "").trim(),
+          departureTime: String(s?.departureTime || "").trim(),
+          lat: Number.isFinite(Number(s?.lat)) ? Number(s.lat) : null,
+          lon: Number.isFinite(Number(s?.lon)) ? Number(s.lon) : null,
+        }))
+        .filter((s) => s.name)
+        .sort((a, c) => (a.order || 0) - (c.order || 0))
+    : [];
+  const via = Array.isArray(b.via)
+    ? b.via.map((v) => String(v || "").trim()).filter(Boolean)
+    : String(b.via || "").split(/[,;|]/).map((v) => v.trim()).filter(Boolean);
+  const statusRaw = String(b.status ?? "").trim().toLowerCase();
+  const active =
+    b.active !== undefined
+      ? !!b.active
+      : !(["inactive", "hidden", "false", "0", "no", "off"].includes(statusRaw));
+  return {
+    busNumber: String(b.busNumber || "").trim(),
+    busName: String(b.busName || "").trim(),
+    // keep `operator` populated from Bus Name so the existing table/column still
+    // shows something sensible for imported rows.
+    operator: String(b.operator || b.busName || "").trim(),
+    state: String(b.state || "Tamil Nadu").trim() || "Tamil Nadu",
+    from: String(b.from || "").trim(),
+    to: String(b.to || "").trim(),
+    via,
+    busType: String(b.busType || "").trim(),
+    distance: String(b.distance || "").trim(),
+    stops,
+    notes: String(b.notes || "").slice(0, 500),
+    active,
+  };
+}
+
+// Bulk import. mode="add" inserts only new routes (existing are skipped, so
+// current data is never overwritten); mode="update" updates existing routes
+// and also inserts any new ones (upsert).
+router.post("/bus-routes/import", requireAdmin, async (req, res) => {
+  try {
+    const mode = String(req.body?.mode || "add").toLowerCase() === "update" ? "update" : "add";
+    const fileName = String(req.body?.fileName || "").slice(0, 200);
+    const routes = Array.isArray(req.body?.routes) ? req.body.routes : [];
+    if (!routes.length) return res.status(400).json({ success: false, message: "No routes to import." });
+
+    let created = 0, updated = 0, skipped = 0;
+    const errors = [];
+
+    for (const raw of routes) {
+      const p = cleanBulkRoute(raw);
+      const vErr = validateBusRoute(p);
+      if (vErr) { errors.push({ busNumber: p.busNumber || "(blank)", reason: vErr }); continue; }
+      const searchKey = String(p.busNumber).toUpperCase().replace(/[\s-]+/g, "");
+      try {
+        const existing = await BusRoute.findOne({ searchKey });
+        if (existing) {
+          if (mode === "add") {
+            skipped++;
+            errors.push({ busNumber: p.busNumber, reason: "Already exists (skipped in Add New mode)" });
+            continue;
+          }
+          Object.assign(existing, p);
+          await existing.save(); // pre-validate recomputes searchKey
+          updated++;
+        } else {
+          await BusRoute.create(p);
+          created++;
+        }
+      } catch (e) {
+        errors.push({ busNumber: p.busNumber, reason: e.code === 11000 ? "Duplicate bus number" : (e.message || "Save failed") });
+      }
+    }
+
+    const success = created + updated;
+    const failed = errors.length;
+    const total = routes.length;
+
+    let historyId = null;
+    try {
+      const doc = await BusRouteImport.create({
+        fileName, mode, total, success, failed, created, updated, skipped,
+        errors: errors.slice(0, 50),
+        by: req.admin?.username || "",
+      });
+      historyId = doc._id;
+    } catch (_e) { /* history is best-effort */ }
+
+    res.json({ success: true, data: { total, success, failed, created, updated, skipped, errors, importId: historyId } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Import failed. Please try again." });
+  }
+});
+
+// Import history — most recent bulk imports (total / successful / failed).
+router.get("/bus-routes/import-history", requireAdmin, async (req, res) => {
+  try {
+    const rows = await BusRouteImport.find().sort({ createdAt: -1 }).limit(20).lean();
+    res.json({ success: true, data: rows });
+  } catch (e) {
+    res.status(500).json({ success: false, message: "Failed to load import history" });
   }
 });
 
