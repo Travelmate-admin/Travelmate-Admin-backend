@@ -15,6 +15,7 @@ const Subscription = require("../models/Subscription");
 const Setting = require("../models/Setting");
 const BusRoute = require("../models/BusRoute");
 const BusRouteImport = require("../models/BusRouteImport");
+const { chennaiRouteError } = require("../utils/chennai");
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "travelmate@admin";
@@ -481,6 +482,9 @@ function validateBusRoute(p) {
   if (!p.busNumber) return "Bus number is required";
   if (!p.from) return "Starting location is required";
   if (!p.to) return "Destination is required";
+  // Chennai-only restriction: start, end and every stop must be within Chennai.
+  const cErr = chennaiRouteError(p);
+  if (cErr) return cErr + ". Only routes within Chennai city are allowed.";
   return "";
 }
 
